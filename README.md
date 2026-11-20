@@ -47,6 +47,45 @@ Then, with a device connected over USB or wireless debugging:
 `./gradlew assembleDebug` builds the APK without installing it
 (`app/build/outputs/apk/debug/`).
 
+## Releases
+
+Pushing a tag like `v1.2.3` runs [`.github/workflows/release.yml`](.github/workflows/release.yml).
+It builds a signed release APK and attaches it to a new GitHub release. The version name comes from
+the tag, and the version code is `major * 10000 + minor * 100 + patch`. Tags with a suffix, such as
+`v1.3.0-beta1`, are published as pre-releases.
+
+```sh
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+You can also run the workflow from the Actions tab to test a build without publishing it.
+
+### Signing key (one-time setup)
+
+APKs are signed with your own key. You don't need a Google Play developer account. Android only
+installs an update when it's signed with the same key as the installed app, so create one key and
+keep it safe. If you lose it, users have to uninstall the app before they can install a new version.
+
+```sh
+keytool -genkeypair -keystore measure-release.jks -alias measure \
+  -keyalg RSA -keysize 4096 -validity 10000
+base64 -w0 measure-release.jks   # copy the output
+```
+
+Add these repository secrets (**Settings → Secrets and variables → Actions**):
+
+| Secret              | Value                                   |
+| ------------------- | --------------------------------------- |
+| `KEYSTORE_BASE64`   | The base64 output from above            |
+| `KEYSTORE_PASSWORD` | The keystore password                   |
+| `KEY_ALIAS`         | `measure`, or the alias you chose       |
+| `KEY_PASSWORD`      | The key password                        |
+
+Back up `measure-release.jks` and its passwords somewhere outside the repo. `*.jks` is gitignored.
+Locally, `./gradlew assembleRelease` signs with the same key if `MEASURE_KEYSTORE_FILE`,
+`MEASURE_KEYSTORE_PASSWORD`, `MEASURE_KEY_ALIAS`, and `MEASURE_KEY_PASSWORD` are set. Otherwise it
+falls back to your debug key.
+
 ## Project layout
 
 ```

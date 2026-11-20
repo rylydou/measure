@@ -13,15 +13,30 @@ android {
         applicationId = "app.measure.ar"
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        // CI passes these from the release tag; local builds use the defaults.
+        versionCode = providers.gradleProperty("versionCode").orNull?.toInt() ?: 1
+        versionName = providers.gradleProperty("versionName").orNull ?: "1.0"
+    }
+
+    // Release signing comes from environment variables so the keystore and passwords never live
+    // in the repo. Without them, release builds fall back to the local debug key.
+    val releaseKeystore = providers.environmentVariable("MEASURE_KEYSTORE_FILE").orNull
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = providers.environmentVariable("MEASURE_KEYSTORE_PASSWORD").get()
+                keyAlias = providers.environmentVariable("MEASURE_KEY_ALIAS").get()
+                keyPassword = providers.environmentVariable("MEASURE_KEY_PASSWORD").get()
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 
