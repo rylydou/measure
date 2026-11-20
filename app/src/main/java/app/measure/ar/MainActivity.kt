@@ -123,6 +123,7 @@ class MainActivity : ComponentActivity() {
                             onWeld = renderer::weld,
                             onDeleteSelected = renderer::deleteSelected,
                             onClearAll = renderer::clearAll,
+                            onDebugChange = { renderer.debugEnabled = it },
                             camera = {
                                 AndroidView(factory = { surfaceView }, modifier = Modifier.fillMaxSize())
                             },

@@ -77,4 +77,6 @@ data class ArFrameState(
     val canDelete: Boolean = false,
     /** There's anything to clear with a long press of delete. */
     val canClear: Boolean = false,
+    /** Surface-estimate debug info, only while the debug overlay is on. */
+    val debug: SurfaceDebug? = null,
 )

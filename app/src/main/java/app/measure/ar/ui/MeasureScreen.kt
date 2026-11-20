@@ -6,6 +6,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.SizeTransform
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.runtime.rememberCoroutineScope
@@ -111,6 +112,7 @@ fun MeasureScreen(
     onWeld: () -> Unit,
     onDeleteSelected: () -> Unit,
     onClearAll: () -> Unit,
+    onDebugChange: (Boolean) -> Unit,
     camera: @Composable () -> Unit,
 ) {
     val haptics = LocalHapticFeedback.current
@@ -138,10 +140,14 @@ fun MeasureScreen(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) hint = "Copied $text"
     }
     var showHelp by rememberSaveable { mutableStateOf(false) }
+    // Debug overlay toggle.
+    var showDebug by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(showDebug) { onDebugChange(showDebug) }
 
     Box(Modifier.fillMaxSize()) {
         camera()
         MeasurementOverlay(state, unit, onCopy = copy)
+        if (showDebug) DebugOverlay(state.debug)
 
         if (unitsExpanded) {
             // Tapping anywhere else closes the unit picker.
@@ -154,6 +160,11 @@ fun MeasureScreen(
 
         CornerButton(
             onClick = { showHelp = true },
+            // Long-pressing help toggles the hidden debug overlay.
+            onLongClick = {
+                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                showDebug = !showDebug
+            },
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .statusBarsPadding()
@@ -238,7 +249,12 @@ fun MeasureScreen(
 
 /** A small round button matching the collapsed unit switcher. */
 @Composable
-private fun CornerButton(onClick: () -> Unit, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+private fun CornerButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    onLongClick: (() -> Unit)? = null,
+    content: @Composable () -> Unit,
+) {
     Surface(
         modifier = modifier,
         shape = CircleShape,
@@ -251,7 +267,7 @@ private fun CornerButton(onClick: () -> Unit, modifier: Modifier = Modifier, con
                 .size(48.dp)
                 .clip(CircleShape)
                 .background(MaterialTheme.colorScheme.secondaryContainer)
-                .clickable(onClick = onClick),
+                .combinedClickable(onClick = onClick, onLongClick = onLongClick),
             contentAlignment = Alignment.Center,
         ) { content() }
     }

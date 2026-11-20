@@ -6,13 +6,11 @@ import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.util.Log
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.content.ContextCompat
 import com.google.ar.core.Anchor
-import com.google.ar.core.DepthPoint
 import com.google.ar.core.Frame
-import com.google.ar.core.HitResult
 import com.google.ar.core.Plane
-import com.google.ar.core.Point
 import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingFailureReason
@@ -25,6 +23,7 @@ import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 /**
  * Owns the AR frame loop: draws the camera, hit-tests the screen center, manages measurement
@@ -65,15 +64,6 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
         data class Line(val segment: Segment) : Selection
     }
 
-    /** The surface under the reticle: a point and its normal (pointing toward the camera). */
-    private class Surface(
-        val position: FloatArray,
-        val normal: FloatArray,
-        /** The raw hit, when [position] came straight from it (lets the anchor attach to a plane). */
-        val hit: HitResult?,
-        val isPlane: Boolean,
-    )
-
     private var segments: List<Segment> = emptyList()
     private var pending: Anchor? = null
 
@@ -99,14 +89,18 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private val view = FloatArray(16)
     private val viewProj = FloatArray(16)
     private var reticleShape = ReticleShape.Facing
-    private var smoothedPosition: FloatArray? = null
-    private var smoothedNormal: FloatArray? = null
-    /** Surface normal each placed point was dropped on, so the reticle can match it when snapping. */
+    /** Surface normal each placed point was dropped on (when known), so the reticle can match it when snapping. */
     private val anchorNormals = HashMap<Anchor, FloatArray>()
     private val density = context.resources.displayMetrics.density
     private val snapRadiusPx = 28f * density
-    private val sampleOffsetPx = 28f * density
     private val hoverRadiusPx = 24f * density
+    private val surfaceEstimator = SurfaceEstimator(density)
+
+    /** Show surface-estimate debug info (see SurfaceDebug.kt). */
+    @Volatile var debugEnabled = false
+    private val debugDeviation = ArrayDeque<Float>()
+    private val debugInstability = ArrayDeque<Float>()
+    private val debugSteady = ArrayDeque<Boolean>()
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -139,9 +133,9 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
         background.draw(frame)
 
         val camera = frame.camera
+        countFrame(frame.timestamp)
         if (camera.trackingState != TrackingState.TRACKING) {
-            smoothedPosition = null
-            smoothedNormal = null
+            surfaceEstimator.reset()
             drainCommands(session, surface = null, snapTarget = null, selection = null, weldTarget = null)
             _state.value = ArFrameState(
                 trackingIssue = camera.trackingFailureReason.toIssue(),
@@ -150,6 +144,7 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
                 canUndo = canUndo(),
                 undoCancels = undoCancels(),
                 canClear = canClear(),
+                debug = if (debugEnabled) SurfaceDebug(sessionLines(session, frame)) else null,
             )
             return
         }
@@ -159,11 +154,12 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
         Matrix.multiplyMM(viewProj, 0, proj, 0, view, 0)
 
         val center = Offset(width / 2f, height / 2f)
-        val surface = estimateSurface(frame, center, camera.pose.translation)?.let(::smooth)
-        if (surface == null) {
-            smoothedPosition = null
-            smoothedNormal = null
-        }
+        val debug = debugEnabled
+        surfaceEstimator.debugEnabled = debug
+        surfaceEstimator.debugMapMs = 0f
+        val estimateStart = System.nanoTime()
+        val surface = surfaceEstimator.estimate(frame, center)
+        val estimateMs = (System.nanoTime() - estimateStart) / 1e6f
         // While dragging, the point can't snap onto itself; any other point it reaches can be welded to.
         val snapTarget = if (moving == null) findSnapTarget(center) else null
         val weldTarget = moving?.let { findSnapTarget(center, exclude = it) }
@@ -187,8 +183,10 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
         // Where the reticle sits in the world: an existing point we snapped to, or the surface.
         val dot = snapTarget ?: activeWeldTarget
         val reticleWorld: FloatArray? = dot?.pose?.translation ?: surface?.position
-        val reticleNormal = dot?.let { anchorNormals[it] } ?: surface?.normal
-        val reticleScreen = reticleWorld?.let(::project)
+        // No trusted normal (a corner, or depth too noisy to tell) means the reticle faces the camera.
+        val reticleNormal = if (dot != null) anchorNormals[dot] else surface?.normal
+        // The reticle stays in the middle of the screen unless it's sitting on an existing point.
+        val reticleScreen = dot?.let { project(it.pose.translation) }
         // Lay the reticle flat on the surface, easing between shapes so it never pops.
         val targetShape = if (reticleWorld != null && reticleNormal != null) {
             reticleShapeFor(reticleWorld, reticleNormal)
@@ -252,6 +250,79 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
             undoCancels = undoCancels(),
             canDelete = selection != null,
             canClear = canClear(),
+            debug = if (debug) buildDebug(session, frame, estimateMs) else null,
+        )
+    }
+
+    private fun buildDebug(session: Session, frame: Frame, estimateMs: Float): SurfaceDebug {
+        val info = surfaceEstimator.debugInfo ?: return SurfaceDebug(sessionLines(session, frame))
+        fun <T> ArrayDeque<T>.push(value: T) {
+            addLast(value)
+            while (size > DEBUG_HISTORY) removeFirst()
+        }
+        debugDeviation.push(info.deviation)
+        debugInstability.push(info.instability)
+        debugSteady.push(info.steady)
+        val projected = info.samples.map { project(it) }
+        return SurfaceDebug(
+            sessionLines = sessionLines(session, frame),
+            lines = info.lines + run {
+                // Report the estimate without the debug-only depth map, which is drawn every few frames.
+                val mapMs = surfaceEstimator.debugMapMs
+                debugEstimateMs += (estimateMs - mapMs - debugEstimateMs) * 0.1f
+                if (mapMs > 0f) debugMapMs = mapMs
+                "estimate ${"%.1f".format(debugEstimateMs)} ms avg  (+ debug map ${"%.1f".format(debugMapMs)} ms)"
+            },
+            samples = projected.filterNotNull(),
+            inliers = projected.indices.filter { projected[it] != null }.map { info.inliers?.getOrNull(it) },
+            deviationHistory = debugDeviation.toList(),
+            instabilityHistory = debugInstability.toList(),
+            steadyHistory = debugSteady.toList(),
+            depthMap = info.depthMap?.asImageBitmap(),
+            steadyBelowDeg = surfaceEstimator.steadyBelowDeg,
+            flatAboveDeg = surfaceEstimator.flatAboveDeg,
+            ringRadiusPx = surfaceEstimator.innerPx,
+            patchRadiusPx = surfaceEstimator.outerPx,
+        )
+    }
+
+    // Debug overlay: frame rates and session info.
+    private var lastDrawNs = 0L
+    private var lastCameraTimestamp = 0L
+    private var lastCameraNs = 0L
+    private var drawFps = 0f
+    private var debugEstimateMs = 0f
+    private var debugMapMs = 0f
+    private var cameraFps = 0f
+
+    private fun countFrame(cameraTimestamp: Long) {
+        val now = System.nanoTime()
+        if (lastDrawNs != 0L) drawFps += (1e9f / max(now - lastDrawNs, 1L) - drawFps) * 0.1f
+        lastDrawNs = now
+        if (cameraTimestamp != lastCameraTimestamp) {
+            if (lastCameraNs != 0L) cameraFps += (1e9f / max(now - lastCameraNs, 1L) - cameraFps) * 0.1f
+            lastCameraNs = now
+            lastCameraTimestamp = cameraTimestamp
+        }
+    }
+
+    private fun sessionLines(session: Session, frame: Frame): List<String> {
+        val config = session.cameraConfig
+        val image = config.imageSize
+        val texture = config.textureSize
+        val fpsRange = config.fpsRange
+        val camera = frame.camera
+        val tracking = camera.trackingState.name.lowercase() +
+            camera.trackingFailureReason.takeIf { it != TrackingFailureReason.NONE }?.let { " (${it.name.lowercase()})" }.orEmpty()
+        val planes = session.getAllTrackables(Plane::class.java)
+            .filter { it.trackingState == TrackingState.TRACKING && it.subsumedBy == null }
+        val horizontal = planes.count { it.type != Plane.Type.VERTICAL }
+        return listOf(
+            "cam ${image.width}x${image.height} tex ${texture.width}x${texture.height} " +
+                "${fpsRange.lower}-${fpsRange.upper}fps  depth ${session.config.depthMode.name.lowercase()}" +
+                (if (config.depthSensorUsage == com.google.ar.core.CameraConfig.DepthSensorUsage.REQUIRE_AND_USE) " +ToF" else ""),
+            "draw ${drawFps.roundToInt()}fps  cam ${cameraFps.roundToInt()}fps  $tracking",
+            "planes ${horizontal}h ${planes.size - horizontal}v  anchors ${liveAnchors.size}  lines ${segments.size}",
         )
     }
 
@@ -381,13 +452,13 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
         segments = newSegments
     }
 
-    private fun createAnchor(session: Session, surface: Surface?, position: FloatArray, normal: FloatArray): Anchor? =
+    private fun createAnchor(session: Session, surface: Surface?, position: FloatArray, normal: FloatArray?): Anchor? =
         try {
             (surface?.hit?.takeIf { surface.position === position }?.createAnchor()
                 ?: session.createAnchor(Pose(position, IDENTITY_ROTATION)))
                 .also {
                     liveAnchors += it
-                    anchorNormals[it] = normal
+                    if (normal != null) anchorNormals[it] = normal
                 }
         } catch (e: Exception) {
             Log.w(TAG, "createAnchor failed", e)
@@ -420,7 +491,7 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private fun endMove(session: Session, surface: Surface?) {
         val old = moving ?: return
         val position = movePosition
-        val normal = surface?.normal ?: moveNormal ?: anchorNormals[old] ?: vec(0f, 1f, 0f)
+        val normal = moveNormal
         cancelMove()
         if (position == null || position.distanceTo(old.pose.translation) < MIN_MOVE_M) return
         val replacement = createAnchor(session, surface, position, normal) ?: return
@@ -518,81 +589,6 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
             ?.first
     }
 
-    // --- Surface estimation ---------------------------------------------------------------------
-
-    /** Best hit at a screen pixel: detected planes are far steadier than raw depth, so prefer them. */
-    private fun sampleAt(frame: Frame, x: Float, y: Float): HitResult? {
-        val hits = frame.hitTest(x, y).filter { it.isUsable() }
-        return hits.firstOrNull { it.trackable is Plane }
-            ?: hits.firstOrNull { it.trackable is DepthPoint }
-            ?: hits.firstOrNull()
-    }
-
-    /**
-     * Finds the surface under the screen center. Detected planes are used as-is. Otherwise a single
-     * depth sample's normal is too noisy (shadows and patterns fool it), so we sample a small cross
-     * around the center and fit a plane through the five points, then intersect the center ray with
-     * it. If the samples don't agree (e.g. straddling a table edge), fall back to the raw hit.
-     */
-    private fun estimateSurface(frame: Frame, center: Offset, cameraPos: FloatArray): Surface? {
-        val hit = sampleAt(frame, center.x, center.y) ?: return null
-        val position = hit.hitPose.translation
-        if (hit.trackable is Plane) return Surface(position, hit.hitPose.yAxis, hit, isPlane = true)
-
-        val toCamera = cameraPos - position
-        val fallback = Surface(position, hit.hitPose.yAxis.facing(toCamera), hit, isPlane = false)
-
-        val d = sampleOffsetPx
-        val neighbors = listOf(-d to 0f, d to 0f, 0f to -d, 0f to d).map { (dx, dy) ->
-            sampleAt(frame, center.x + dx, center.y + dy)
-                ?.takeIf { it.trackable !is Point }
-                ?.hitPose?.translation
-                ?: return fallback
-        }
-        val (left, right, up, down) = neighbors
-        val normal = ((right - left) cross (down - up)).normalized()?.facing(toCamera) ?: return fallback
-
-        val points = neighbors + listOf(position)
-        val mean = points.centroid()
-        val tolerance = max(MIN_PLANE_TOLERANCE_M, PLANE_TOLERANCE_PER_M * position.distanceTo(cameraPos))
-        if (points.any { abs((it - mean) dot normal) > tolerance }) return fallback
-
-        val ray = (position - cameraPos).normalized() ?: return fallback
-        val denom = ray dot normal
-        if (abs(denom) < MIN_RAY_ANGLE_COS) return fallback // Too grazing to intersect reliably.
-        val t = ((mean - cameraPos) dot normal) / denom
-        return Surface(cameraPos + ray * t, normal, hit = null, isPlane = false)
-    }
-
-    /**
-     * Eases the surface over time. Planes are already stable, so they only get light smoothing of
-     * the normal; depth-based surfaces get heavier smoothing of both normal and position. Big
-     * position jumps (moving onto a different object) are taken immediately.
-     */
-    private fun smooth(s: Surface): Surface {
-        val normalAlpha = if (s.isPlane) PLANE_NORMAL_SMOOTHING else DEPTH_NORMAL_SMOOTHING
-        val normal = smoothedNormal?.lerp(s.normal, normalAlpha)?.normalized() ?: s.normal
-        smoothedNormal = normal
-
-        val prev = smoothedPosition
-        val position = if (s.isPlane || prev == null || prev.distanceTo(s.position) > POSITION_JUMP_M) {
-            s.position
-        } else {
-            prev.lerp(s.position, DEPTH_POSITION_SMOOTHING)
-        }
-        smoothedPosition = position
-        return Surface(position, normal, if (position === s.position) s.hit else null, s.isPlane)
-    }
-
-    private fun FloatArray.facing(toCamera: FloatArray) = if ((this dot toCamera) < 0f) -this else this
-
-    private fun HitResult.isUsable(): Boolean = when (val t = trackable) {
-        is Plane -> t.trackingState == TrackingState.TRACKING && t.isPoseInPolygon(hitPose)
-        is DepthPoint -> true
-        is Point -> t.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL
-        else -> false
-    }
-
     private fun Anchor.isStopped() = trackingState == TrackingState.STOPPED
 
     // --- Projection -----------------------------------------------------------------------------
@@ -672,13 +668,7 @@ class MeasureRenderer(private val context: Context) : GLSurfaceView.Renderer {
         const val RETICLE_SMOOTHING = 0.5f
         const val MIN_MOVE_M = 0.001f
         const val MAX_HISTORY = 100
-        const val PLANE_NORMAL_SMOOTHING = 0.4f
-        const val DEPTH_NORMAL_SMOOTHING = 0.15f
-        const val DEPTH_POSITION_SMOOTHING = 0.35f
-        const val POSITION_JUMP_M = 0.05f
-        const val MIN_PLANE_TOLERANCE_M = 0.01f
-        const val PLANE_TOLERANCE_PER_M = 0.02f
-        const val MIN_RAY_ANGLE_COS = 0.15f
+        const val DEBUG_HISTORY = 120
         val IDENTITY_ROTATION = floatArrayOf(0f, 0f, 0f, 1f)
     }
 }
