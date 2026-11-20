@@ -1,0 +1,9 @@
+# Normalize line endings; keep scripts runnable on every platform.
+* text=auto eol=lf
+*.bat text eol=crlf
+gradlew text eol=lf
+
+# Binary files
+*.jar binary
+*.png binary
+*.webp binary
