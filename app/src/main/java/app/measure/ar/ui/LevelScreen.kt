@@ -85,9 +85,10 @@ private data class Up(val x: Float, val y: Float, val z: Float)
 /**
  * A bubble level in the style of Apple's Measure app, drawn as one continuous fluid.
  *
- * Standing on an edge, the accent color fills the screen from the top down to the horizon. Tilting
- * the screen to face up pulls that fill into a round bubble on a black background (a floor level);
- * tilting it to face down shrinks the black part into a bubble instead (a ceiling level). The
+ * Standing on an edge, the accent color fills the screen from the top down to a flat horizon.
+ * Tilting the screen to face up slides the horizon off the top, then an accent bubble rolls in on
+ * black (a floor level); tilting it to face down floods the screen with accent, then a black bubble
+ * rolls in (a ceiling level). The
  * readout is the tilt from upright on an edge and the tilt from flat as a bubble. Tap to measure
  * against the current angle; tap again to go back to true level.
  */
@@ -208,15 +209,15 @@ private fun DrawScope.drawLevel(
     degreeSignWidth: Int,
 ) {
     val tilt = level.tilt
-    val bubbleWeight = smoothstep(60f, 80f, tilt)
-    val edgeWeight = 1f - smoothstep(25f, 45f, tilt)
+    // The target ring fades in between 30° and 25° from flat.
+    val ringWeight = smoothstep(90f - RING_FADE_START, 90f - RING_FADE_END, tilt)
+    val edgeWeight = 1f - smoothstep(EXIT_TILT - 10f, EXIT_TILT, tilt)
     val roundness = (1f - level.error / 10f).coerceIn(0f, 1f)
     val fluid = fluidPath(
         up = up,
-        bubbleWeight = bubbleWeight,
         bubbleScale = bubbleScale,
         // Far from level the bubble is a scalloped cookie; it smooths into a circle as it closes in.
-        morphProgress = if (level.isLevel) 1f else 1f - (1f - roundness * roundness) * bubbleWeight,
+        morphProgress = if (level.isLevel) 1f else roundness * roundness,
         morph = morph,
         morphPath = morphPath,
     )
@@ -230,24 +231,20 @@ private fun DrawScope.drawLevel(
     }
 
     val r0 = size.minDimension * BUBBLE_RADIUS
-    if (bubbleWeight > 0f) {
-        val tick = r0 * 1.35f
+    if (ringWeight > 0f) {
         twoTone { onFluid ->
             val color = if (onFluid) palette.onFill else palette.onBlack
-            val alpha = bubbleWeight * if (onFluid) 0.7f else 0.5f + 0.5f * levelProgress
-            drawLine(color, center - Offset(tick, 0f), center + Offset(tick, 0f), 1.dp.toPx(), alpha = alpha * 0.6f)
-            drawLine(color, center - Offset(0f, tick), center + Offset(0f, tick), 1.dp.toPx(), alpha = alpha * 0.6f)
+            val alpha = ringWeight * if (onFluid) 0.7f else 0.5f + 0.5f * levelProgress
             drawCircle(color, radius = r0, center = center, style = Stroke(3.dp.toPx()), alpha = alpha)
         }
     }
 
-    // The number stays upright against the real horizon, like the fluid. As a bubble there's no
-    // horizon, so it eases back to the phone's own orientation.
-    val textAngle = level.base + wrapDegrees(level.roll - level.base) * edgeWeight
+    // The number stays upright against the real horizon, freezing near flat where that direction
+    // stops being meaningful.
     val digitsWidth = text.size.width - degreeSignWidth
     val textTopLeft = Offset(center.x - digitsWidth / 2f, center.y - text.size.height / 2f)
     twoTone { onFluid ->
-        rotate(textAngle, center) {
+        rotate(level.textAngle, center) {
             drawText(text, color = if (onFluid) palette.onFill else palette.onBlack, topLeft = textTopLeft)
         }
     }
@@ -272,92 +269,91 @@ private fun DrawScope.drawLevel(
 }
 
 /**
- * The accent-colored area. It's a disk whose edge nearest the screen center is the horizon: huge
- * (so the edge looks straight) when the phone is upright, shrinking to the bubble as it lies flat.
- * Face down, the disk is the black area instead and the accent is everything around it.
+ * The accent-colored area.
+ *
+ * Near upright it's everything above a straight horizon. Tilting the screen to face up slides the
+ * horizon off the top until the screen is black, then an accent bubble rolls in from that side.
+ * Tilting it to face down slides the horizon off the bottom until the screen is all accent, then a
+ * black bubble rolls in from the bottom.
  */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 private fun DrawScope.fluidPath(
     up: Up,
-    bubbleWeight: Float,
     bubbleScale: Float,
     morphProgress: Float,
     morph: Morph,
     morphPath: Path,
 ): Path {
     val diagonal = hypot(size.width, size.height)
-    val r0 = size.minDimension * BUBBLE_RADIUS
-    val t = asin(abs(up.z).coerceAtMost(1f))
-    val s = sin(t)
-    val s2 = s * s
-
-    // Radius r0/sin²: effectively infinite on an edge, exactly r0 flat. The near edge starts at the
-    // screen center, then the shape drifts toward the raised side as it rounds into the bubble.
-    val baseRadius = r0 / max(s2, 1e-7f)
-    val scale = 1f + (bubbleScale - 1f) * bubbleWeight
-    val radius = baseRadius * scale
+    val tilt = asin(abs(up.z).coerceAtMost(1f))
+    val exit = EXIT_TILT * PI.toFloat() / 180f
+    val faceUp = up.z >= 0f
 
     val planar = hypot(up.x, up.y)
     val upOnScreen = if (planar > 1e-4f) Offset(up.x / planar, -up.y / planar) else Offset(0f, -1f)
-    val dir = if (up.z >= 0f) upOnScreen else -upOnScreen
+    // How far the screen reaches in that direction from its center (to its farthest corner).
+    val room = abs(upOnScreen.x) * size.width / 2f + abs(upOnScreen.y) * size.height / 2f
 
-    // How far the fluid drifts: scaled to the room on screen in that direction while it's a
-    // horizon, so landscape behaves like portrait, but even in every direction as a bubble.
-    val room = abs(dir.x) * size.width / 2f + abs(dir.y) * size.height / 2f
-    val travel = room * HORIZON_TRAVEL + (size.minDimension * BUBBLE_TRAVEL - room * HORIZON_TRAVEL) * bubbleWeight
-    val nearEdge = -r0 * s2 + travel * cos(t) * s + baseRadius - radius
-    val perp = Offset(-dir.y, dir.x)
-    val near = center + dir * nearEdge
-
-    val disk = if (radius < 2f * diagonal) {
-        val diskCenter = near + dir * radius
-        if (bubbleWeight > 0f && radius < 3f * r0) {
-            morphPath.rewind()
-            morph.toPath(morphProgress, morphPath)
-            val bounds = morphPath.getBounds()
-            // Roll the bubble as it travels, like a ball.
-            val rollDegrees = (dir.x * (nearEdge + radius) / r0) * 180f / PI.toFloat()
-            val matrix = android.graphics.Matrix().apply {
-                setTranslate(-bounds.center.x, -bounds.center.y)
-                postScale(2f * radius / bounds.maxDimension, 2f * radius / bounds.maxDimension)
-                postRotate(rollDegrees)
-                postTranslate(diskCenter.x, diskCenter.y)
-            }
-            Path().apply {
-                addPath(morphPath)
-                asAndroidPath().transform(matrix)
-            }
-        } else {
-            Path().apply { addOval(Rect(diskCenter, radius)) }
-        }
-    } else {
-        // Too big to hand to the renderer as a circle: trace only the arc that can reach the
-        // screen, then close the shape far beyond it on the inside.
-        val span = min(1.3f * 2f * asin(diagonal / (2f * radius)), PI.toFloat() / 2f)
-        Path().apply {
-            for (i in 0..ARC_STEPS) {
-                val theta = -span + 2f * span * i / ARC_STEPS
-                val half = sin(theta / 2f)
-                val point = near + dir * (2f * radius * half * half) + perp * (radius * sin(theta))
-                if (i == 0) moveTo(point.x, point.y) else lineTo(point.x, point.y)
-            }
-            val endLateral = radius * sin(span)
-            val endDepth = 2f * radius * sin(span / 2f) * sin(span / 2f)
-            val far = near + dir * (endDepth + 3f * diagonal)
-            lineTo((far + perp * endLateral).x, (far + perp * endLateral).y)
-            lineTo((far - perp * endLateral).x, (far - perp * endLateral).y)
+    if (tilt < exit) {
+        // The horizon reaches the farthest corner exactly as the bubble starts to come in.
+        val offset = room * sin(tilt) / sin(exit) * if (faceUp) 1f else -1f
+        val onLine = center + upOnScreen * offset
+        val across = Offset(-upOnScreen.y, upOnScreen.x) * diagonal
+        val beyond = upOnScreen * (2f * diagonal)
+        return Path().apply {
+            moveTo((onLine + across).x, (onLine + across).y)
+            lineTo((onLine - across).x, (onLine - across).y)
+            lineTo((onLine - across + beyond).x, (onLine - across + beyond).y)
+            lineTo((onLine + across + beyond).x, (onLine + across + beyond).y)
             close()
         }
     }
-    if (up.z >= 0f) return disk
+
+    // The bubble sits off the raised side (face up) or lowered side (face down) of the screen and
+    // moves in as the phone nears flat: steadily near flat, then quickly out past the edge.
+    val r0 = size.minDimension * BUBBLE_RADIUS
+    val radius = r0 * bubbleScale
+    val fromFlat = PI.toFloat() / 2f - tilt
+    val maxFromFlat = PI.toFloat() / 2f - exit
+    val travel = size.minDimension * BUBBLE_TRAVEL
+    val offscreen = room + radius * 1.25f
+    val catchUp = max(0f, offscreen - travel * sin(maxFromFlat))
+    val progress = fromFlat / maxFromFlat
+    val distance = travel * sin(fromFlat) + catchUp * progress * progress * progress
+    val dir = if (faceUp) upOnScreen else -upOnScreen
+    val bubbleCenter = center + dir * distance
+
+    morphPath.rewind()
+    morph.toPath(morphProgress, morphPath)
+    val bounds = morphPath.getBounds()
+    // Roll the bubble as it travels, like a ball.
+    val rollDegrees = (dir.x * distance / r0) * 180f / PI.toFloat()
+    val matrix = android.graphics.Matrix().apply {
+        setTranslate(-bounds.center.x, -bounds.center.y)
+        postScale(2f * radius / bounds.maxDimension, 2f * radius / bounds.maxDimension)
+        postRotate(rollDegrees)
+        postTranslate(bubbleCenter.x, bubbleCenter.y)
+    }
+    val bubble = Path().apply {
+        addPath(morphPath)
+        asAndroidPath().transform(matrix)
+    }
+    if (faceUp) return bubble
     val screen = Path().apply { addRect(Rect(Offset.Zero, size)) }
-    return Path().apply { op(screen, disk, PathOperation.Difference) }
+    return Path().apply { op(screen, bubble, PathOperation.Difference) }
 }
 
+/** Degrees from upright where the horizon has left the screen and the bubble takes over. */
+private const val EXIT_TILT = 45f
+
+/** Degrees from flat over which the bubble's target ring fades in. */
+private const val RING_FADE_START = 30f
+private const val RING_FADE_END = 5f
+
+/** Degrees from flat around which the number eases to a stop instead of turning with the horizon. */
+private const val TEXT_FREEZE = 20f
 private const val BUBBLE_RADIUS = 0.3f
 private const val BUBBLE_TRAVEL = 1.2f
-private const val HORIZON_TRAVEL = 1.07f
-private const val ARC_STEPS = 64
 
 @Stable
 private class LevelState {
@@ -383,11 +379,15 @@ private class LevelState {
     var degrees by mutableIntStateOf(0)
         private set
 
-    /** Clockwise screen rotation of the horizon, in degrees. */
+    /** Clockwise screen rotation of the horizon, in degrees. Held as a bubble, where there's no horizon. */
     var roll by mutableFloatStateOf(0f)
         private set
 
-    /** The screen orientation the phone is nearest to (0, ±90, 180), for the marks and text. */
+    /** Rotation of the number: follows the horizon, easing to a stop around [TEXT_FREEZE] from flat. */
+    var textAngle by mutableFloatStateOf(0f)
+        private set
+
+    /** The screen orientation the phone is nearest to (0, ±90, 180), for the marks. */
     var base by mutableFloatStateOf(0f)
         private set
     private var hasBase = false
@@ -403,8 +403,18 @@ private class LevelState {
         tilt = asin(abs(u.z).coerceAtMost(1f)).toDegrees()
         error = min(tilt, 90f - tilt)
 
-        // The horizon's direction is only meaningful while the phone isn't close to flat.
-        if (hypot(u.x, u.y) > 0.35f) {
+        // Near flat the horizon's direction is mostly noise, so the number stops turning there
+        // rather than spinning around as the phone lies down. It eases between following and
+        // frozen across a band, so it never snaps to a new angle when it starts following again.
+        val follow = smoothstep(TEXT_FREEZE - 5f, TEXT_FREEZE + 10f, 90f - tilt)
+        if (follow > 0f) {
+            val target = atan2(u.x, u.y).toDegrees()
+            val catchUp = if (follow >= 1f) 1f else follow * follow * follow
+            textAngle = wrapDegrees(textAngle + wrapDegrees(target - textAngle) * catchUp)
+        }
+
+        // The horizon itself (and the marks that line up with it) only exist on an edge.
+        if (tilt < EXIT_TILT) {
             roll = atan2(u.x, u.y).toDegrees()
             if (!hasBase || abs(wrapDegrees(roll - base)) > 50f) {
                 base = wrapDegrees((roll / 90f).roundToInt() * 90f)
@@ -413,7 +423,6 @@ private class LevelState {
             val rollError = abs(wrapDegrees(roll - base))
             rollAligned = tilt < 45f && rollError < if (rollAligned) 1f else 0.5f
         } else {
-            roll = base
             rollAligned = false
         }
 
