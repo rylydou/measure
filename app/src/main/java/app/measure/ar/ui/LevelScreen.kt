@@ -5,6 +5,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.SystemClock
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
@@ -63,6 +64,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.graphics.shapes.Morph
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import kotlinx.coroutines.delay
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.acos
@@ -88,15 +90,23 @@ private data class Up(val x: Float, val y: Float, val z: Float)
  * Standing on an edge, the accent color fills the screen from the top down to a flat horizon.
  * Tilting the screen to face up slides the horizon off the top, then an accent bubble rolls in on
  * black (a floor level); tilting it to face down floods the screen with accent, then a black bubble
- * rolls in (a ceiling level). The
- * readout is the tilt from upright on an edge and the tilt from flat as a bubble. Tap to measure
- * against the current angle; tap again to go back to true level.
+ * rolls in (a ceiling level). The readout is the tilt from upright on an edge and the tilt from flat
+ * as a bubble. Tap to measure against the current angle; tap again to go back to true level.
+ *
+ * Leaving the phone face down on a level surface for a few seconds calibrates it: lying on its
+ * screen it sits truly flat (face up it rocks on the camera bump), so whatever the sensor reads
+ * there becomes the new zero.
  */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun LevelScreen(modifier: Modifier = Modifier) {
-    val level = remember { LevelState() }
     val context = LocalContext.current
+    val level = remember {
+        LevelState(
+            calibration = LevelCalibration.load(context),
+            onCalibrate = { LevelCalibration.save(context, it) },
+        )
+    }
     LifecycleResumeEffect(level) {
         val stop = listenForGravity(context, level::update)
         onPauseOrDispose { stop() }
@@ -109,11 +119,22 @@ fun LevelScreen(modifier: Modifier = Modifier) {
     LaunchedEffect(level.rollAligned) {
         if (level.rollAligned) haptics.performHapticFeedback(HapticFeedbackType.SegmentTick)
     }
+    // The screen is hidden face down, so calibrating is felt rather than seen. The notice stays up
+    // until a few seconds after the phone is picked up.
+    LaunchedEffect(level.calibrations) {
+        if (level.calibrations > 0) haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+    }
+    LaunchedEffect(level.justCalibrated, level.restingFaceDown) {
+        if (level.justCalibrated && !level.restingFaceDown) {
+            delay(3_000)
+            level.dismissCalibratedNotice()
+        }
+    }
 
     val colors = MaterialTheme.colorScheme
     val motion = MaterialTheme.motionScheme
     // A saved reference angle swaps the accent to tertiary so it's clear the reading is relative.
-    val relative = level.calibrated
+    val relative = level.relative
     val accent by animateColorAsState(
         if (relative) colors.tertiary else colors.primary, motion.defaultEffectsSpec(), label = "accent",
     )
@@ -173,8 +194,16 @@ fun LevelScreen(modifier: Modifier = Modifier) {
             drawLevel(level, up, palette, levelProgress, alignProgress, bubbleScale, morph, morphPath, text, degreeSignWidth)
         }
 
+        val notice = when {
+            level.justCalibrated -> "Calibrated to this surface"
+            level.relative -> "Relative to saved angle · Tap to reset"
+            else -> null
+        }
+        // Keep showing the last text while animating out.
+        var lastNotice by remember { mutableStateOf(notice) }
+        if (notice != null) lastNotice = notice
         AnimatedVisibility(
-            visible = level.calibrated,
+            visible = notice != null,
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .statusBarsPadding()
@@ -184,7 +213,7 @@ fun LevelScreen(modifier: Modifier = Modifier) {
         ) {
             Surface(shape = CircleShape, color = colors.tertiaryContainer, shadowElevation = 6.dp) {
                 Text(
-                    "Relative to saved angle · Tap to reset",
+                    lastNotice.orEmpty(),
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
                     style = MaterialTheme.typography.titleSmall,
                     color = colors.onTertiaryContainer,
@@ -356,14 +385,38 @@ private const val BUBBLE_RADIUS = 0.3f
 private const val BUBBLE_TRAVEL = 1.2f
 
 @Stable
-private class LevelState {
+private class LevelState(calibration: Up?, private val onCalibrate: (Up) -> Unit) {
     /** The latest smoothed reading (relative to the reference, if set), or null until the sensor reports. */
     var up by mutableStateOf<Up?>(null)
         private set
-    private var raw: Up? = null
 
+    /** The latest raw sensor reading, and that reading with the sensor calibration applied. */
+    private var latest: Up? = null
+    private var corrected: Up? = null
+
+    /** Corrects the sensor's own tilt, from what it read lying face down on a level surface. */
+    private var correction = calibration?.let { Rotation.between(it, FACE_DOWN) }
+
+    /** A saved pose the readings are measured against (tap to set). */
     private var reference by mutableStateOf<Rotation?>(null)
-    val calibrated get() = reference != null
+    val relative get() = reference != null
+
+    /** Lying face down, nearly flat, waiting to see whether it holds still long enough to calibrate. */
+    var restingFaceDown by mutableStateOf(false)
+        private set
+    private var restAnchor: Up? = null
+    private var restSince = 0L
+    private var restSumX = 0f
+    private var restSumY = 0f
+    private var restSumZ = 0f
+    /** Calibrate once per time it's laid down, not over and over while it stays there. */
+    private var calibrationArmed = true
+
+    /** Counts calibrations, so each one can be signalled. */
+    var calibrations by mutableIntStateOf(0)
+        private set
+    var justCalibrated by mutableStateOf(false)
+        private set
 
     /** Degrees the screen faces away from vertical: 0 standing on an edge, 90 lying flat. */
     var tilt by mutableFloatStateOf(0f)
@@ -397,8 +450,11 @@ private class LevelState {
         private set
 
     fun update(reading: Up) {
-        raw = reading
-        val u = reference?.apply(reading) ?: reading
+        latest = reading
+        watchForCalibration(reading)
+        val c = correction?.apply(reading) ?: reading
+        corrected = c
+        val u = reference?.apply(c) ?: c
         up = u
         tilt = asin(abs(u.z).coerceAtMost(1f)).toDegrees()
         error = min(tilt, 90f - tilt)
@@ -435,8 +491,47 @@ private class LevelState {
     }
 
     fun toggleReference() {
-        reference = if (reference != null) null else raw?.let(Rotation::toNearestLevel)
-        raw?.let(::update)
+        reference = if (reference != null) null else corrected?.let(Rotation::toNearestLevel)
+        justCalibrated = false
+        latest?.let(::update)
+    }
+
+    fun dismissCalibratedNotice() {
+        justCalibrated = false
+    }
+
+    /**
+     * Calibrates once the raw reading has stayed face down within [CALIBRATION_MAX_TILT] of flat,
+     * moving less than [CALIBRATION_STILLNESS], for [CALIBRATION_HOLD_MS].
+     */
+    private fun watchForCalibration(raw: Up) {
+        val fromFaceDown = angleBetween(raw, FACE_DOWN)
+        val resting = fromFaceDown < CALIBRATION_MAX_TILT
+        if (fromFaceDown > CALIBRATION_REARM_TILT) calibrationArmed = true
+        restingFaceDown = resting
+        if (!resting || !calibrationArmed) {
+            restAnchor = null
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        val anchor = restAnchor
+        if (anchor == null || angleBetween(raw, anchor) > CALIBRATION_STILLNESS) {
+            restAnchor = raw
+            restSince = now
+            restSumX = 0f; restSumY = 0f; restSumZ = 0f
+        }
+        restSumX += raw.x; restSumY += raw.y; restSumZ += raw.z
+        if (now - restSince < CALIBRATION_HOLD_MS) return
+
+        val length = sqrt(restSumX * restSumX + restSumY * restSumY + restSumZ * restSumZ)
+        val average = Up(restSumX / length, restSumY / length, restSumZ / length)
+        correction = Rotation.between(average, FACE_DOWN)
+        reference = null
+        onCalibrate(average)
+        calibrationArmed = false
+        restAnchor = null
+        justCalibrated = true
+        calibrations++
     }
 
     private fun Float.toDegrees() = this * 180f / PI.toFloat()
@@ -460,12 +555,17 @@ private class Rotation(private val axis: Up, private val cos: Float, private val
 
     companion object {
         /** The rotation taking [from] to the level pose it's closest to: flat, or upright on an edge. */
-        fun toNearestLevel(from: Up): Rotation? {
-            val to = when {
+        fun toNearestLevel(from: Up): Rotation? = between(
+            from,
+            when {
                 abs(from.z) >= sqrt(0.5f) -> Up(0f, 0f, sign(from.z))
                 abs(from.x) > abs(from.y) -> Up(sign(from.x), 0f, 0f)
                 else -> Up(0f, sign(from.y), 0f)
-            }
+            },
+        )
+
+        /** The smallest rotation taking unit vector [from] to unit vector [to]. */
+        fun between(from: Up, to: Up): Rotation? {
             val ax = from.y * to.z - from.z * to.y
             val ay = from.z * to.x - from.x * to.z
             val az = from.x * to.y - from.y * to.x
@@ -474,6 +574,36 @@ private class Rotation(private val axis: Up, private val cos: Float, private val
             val cos = (from.x * to.x + from.y * to.y + from.z * to.z).coerceIn(-1f, 1f)
             return Rotation(Up(ax / length, ay / length, az / length), cos, sin(acos(cos)))
         }
+    }
+}
+
+private val FACE_DOWN = Up(0f, 0f, -1f)
+
+/** Face down further off flat than this, the surface clearly isn't level, so don't calibrate. */
+private const val CALIBRATION_MAX_TILT = 5f
+/** Tilt off face down that counts as picking the phone back up. */
+private const val CALIBRATION_REARM_TILT = 20f
+private const val CALIBRATION_STILLNESS = 0.3f
+private const val CALIBRATION_HOLD_MS = 3_000L
+
+private fun angleBetween(a: Up, b: Up): Float =
+    acos((a.x * b.x + a.y * b.y + a.z * b.z).coerceIn(-1f, 1f)) * 180f / PI.toFloat()
+
+/** The level's saved calibration: what the sensor read lying face down on a level surface. */
+private object LevelCalibration {
+    private const val PREFS = "measure"
+    private const val KEY = "level_calibration"
+
+    fun load(context: Context): Up? {
+        val saved = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, null) ?: return null
+        val v = saved.split(",").mapNotNull { it.toFloatOrNull() }
+        return if (v.size == 3) Up(v[0], v[1], v[2]) else null
+    }
+
+    fun save(context: Context, reading: Up) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY, "${reading.x},${reading.y},${reading.z}")
+            .apply()
     }
 }
 
