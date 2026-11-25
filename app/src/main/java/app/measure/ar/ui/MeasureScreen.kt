@@ -83,6 +83,7 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import app.measure.ar.R
 import app.measure.ar.ar.ArFrameState
@@ -114,6 +115,7 @@ fun MeasureScreen(
     onClearAll: () -> Unit,
     onDebugChange: (Boolean) -> Unit,
     camera: @Composable () -> Unit,
+    bottomPadding: Dp = 24.dp,
 ) {
     val haptics = LocalHapticFeedback.current
     LaunchedEffect(state.snapped) {
@@ -203,7 +205,7 @@ fun MeasureScreen(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .navigationBarsPadding()
-                .padding(bottom = 24.dp),
+                .padding(bottom = bottomPadding),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {

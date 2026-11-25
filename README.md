@@ -17,6 +17,9 @@ Compose using Material 3 Expressive.
   everything. Every change can be undone.
 - **Copy:** tap any measurement to copy it.
 - **Units:** cm, m, in, or ft (feet and inches). Your choice is remembered.
+- **Level:** switch to **Level** at the bottom for a bubble level. Lay the phone flat to use the
+  bubble, or stand it on an edge to see the horizon. Tap the screen to measure against the current
+  angle, and tap again to go back to true level.
 
 Tap **?** in the app for a quick guide to the less obvious controls.
 

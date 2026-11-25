@@ -10,15 +10,22 @@ import android.os.Bundle
 import android.provider.Settings
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Button
@@ -42,7 +49,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.measure.ar.ar.MeasureRenderer
+import app.measure.ar.ui.AppMode
 import app.measure.ar.ui.LengthUnit
+import app.measure.ar.ui.LevelScreen
+import app.measure.ar.ui.ModeSwitcher
+import app.measure.ar.ui.ModeSwitcherClearance
 import app.measure.ar.ui.MeasureScreen
 import app.measure.ar.ui.MeasureTheme
 import com.google.ar.core.ArCoreApk
@@ -67,6 +78,7 @@ class MainActivity : ComponentActivity() {
 
     private var status by mutableStateOf<Status>(Status.Starting)
     private var unit by mutableStateOf(LengthUnit.Centimeters)
+    private var mode by mutableStateOf(AppMode.Measure)
 
     private var session: Session? = null
     private var installRequested = false
@@ -83,6 +95,7 @@ class MainActivity : ComponentActivity() {
             // On grant, onResume runs next and starts the session.
         }
 
+    @OptIn(ExperimentalMaterial3ExpressiveApi::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(
@@ -106,6 +119,8 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MeasureTheme {
+                BackHandler(enabled = mode == AppMode.Level) { switchMode(AppMode.Measure) }
+                Box(Modifier.fillMaxSize()) {
                 when (val s = status) {
                     Status.Running, Status.Starting -> {
                         val frame by renderer.state.collectAsStateWithLifecycle()
@@ -114,7 +129,7 @@ class MainActivity : ComponentActivity() {
                             unit = unit,
                             onUnitChange = {
                                 unit = it
-                                LengthUnit.save(this, it)
+                                LengthUnit.save(this@MainActivity, it)
                             },
                             onAddPoint = renderer::addPoint,
                             onBeginMove = renderer::beginMove,
@@ -127,6 +142,7 @@ class MainActivity : ComponentActivity() {
                             camera = {
                                 AndroidView(factory = { surfaceView }, modifier = Modifier.fillMaxSize())
                             },
+                            bottomPadding = ModeSwitcherClearance,
                         )
                     }
                     is Status.NeedsPermission -> MessageScreen(
@@ -153,13 +169,46 @@ class MainActivity : ComponentActivity() {
                         },
                     )
                 }
+
+                val motion = MaterialTheme.motionScheme
+                AnimatedVisibility(
+                    visible = mode == AppMode.Level,
+                    enter = fadeIn(motion.defaultEffectsSpec()) + scaleIn(motion.defaultSpatialSpec(), initialScale = 0.94f),
+                    exit = fadeOut(motion.defaultEffectsSpec()) + scaleOut(motion.defaultSpatialSpec(), targetScale = 0.94f),
+                ) {
+                    // The level is always dark, like the camera view it replaces.
+                    MeasureTheme(darkTheme = true) { LevelScreen() }
+                }
+
+                ModeSwitcher(
+                    mode = mode,
+                    onModeChange = ::switchMode,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding()
+                        .padding(bottom = 16.dp),
+                )
+                }
             }
+        }
+    }
+
+    /** The level doesn't need the camera, so AR pauses while it's showing. */
+    private fun switchMode(target: AppMode) {
+        if (target == mode) return
+        mode = target
+        when (target) {
+            AppMode.Level -> {
+                surfaceView.onPause()
+                session?.pause()
+            }
+            AppMode.Measure -> if (hasCameraPermission()) startSession()
         }
     }
 
     override fun onResume() {
         super.onResume()
-        if (hasCameraPermission()) startSession()
+        if (mode == AppMode.Measure && hasCameraPermission()) startSession()
     }
 
     override fun onPause() {
